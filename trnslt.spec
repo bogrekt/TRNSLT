@@ -20,8 +20,11 @@ for package in ("faster_whisper", "ctranslate2", "av", "onnxruntime", "tokenizer
     binaries += pkg_binaries
     hiddenimports += pkg_hidden
 
-# Модель кладём отдельной папкой — engine.py ищет её в models/ рядом с приложением.
-datas.append((str(PAYLOAD / "models"), "models"))
+# Модели кладём поимённо, а не всю папку разом: в build_payload могут лежать
+# и другие, скачанные для замеров, — однажды так в архив уехала лишняя копия
+# модели на 461 МБ. engine.py ищет их в models/ рядом с приложением.
+for folder in ("small", "diarization"):
+    datas.append((str(PAYLOAD / "models" / folder), f"models/{folder}"))
 
 # CUDA-библиотеки кладём в корень _internal, рядом с ctranslate2.dll. В подпапке
 # PyInstaller всё равно продублирует их в корень как найденные зависимости —

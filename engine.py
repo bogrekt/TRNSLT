@@ -63,6 +63,7 @@ MODELS: list[tuple[str, str]] = [
     ("base", "base — быстро"),
     ("small", "small — рекомендую"),
     ("medium", "medium — точнее, дольше"),
+    ("large-v3-turbo", "turbo — как large, но быстро"),
     ("large-v3", "large-v3 — лучшее качество"),
 ]
 
@@ -88,10 +89,31 @@ SPEAKER_COUNTS: list[tuple[int, str]] = [
     *[(n, f"{n} говорящих") for n in range(2, 11)],
 ]
 
-# Сколько кусков речи уходит в видеокарту за раз. Замер на 17 минутах:
-# по одному — 87 секунд, пачками по 8 — 46. Шестнадцать уже хуже: не хватает
-# видеопамяти на 4 ГБ и начинается своп.
-BATCH_SIZE = 8
+# Сколько весит скачивание модели, если её нет в комплекте — для подсказки в окне.
+MODEL_DOWNLOADS: dict[str, str] = {
+    "tiny": "75 МБ",
+    "base": "145 МБ",
+    "small": "460 МБ",
+    "medium": "1.5 ГБ",
+    "large-v3-turbo": "1.6 ГБ",
+    "large-v3": "2.9 ГБ",
+}
+
+# Сколько кусков речи уходит в видеокарту за раз. На small замер показал:
+# по одному — 87 секунд, пачками по 8 — 46, по 16 уже хуже. Но чем крупнее
+# модель, тем меньше должна быть пачка: turbo с восьмёркой занял 3.2 ГБ из 4,
+# а на чужой видеокарте свободного может оказаться меньше.
+BATCH_SIZES: dict[str, int] = {
+    "tiny": 8, "base": 8, "small": 8,
+    "medium": 4, "large-v3-turbo": 4, "large-v3": 4,
+}
+DEFAULT_BATCH = 4
+
+# Если видеопамяти не хватило — пробуем ещё раз пачкой поменьше, а потом
+# и вовсе по одному куску. Замер large-v3 на 4 ГБ: пачка 8 оставляла 213 МБ
+# свободными, пачка 4 — 344 МБ, пачка 2 — 856 МБ. На чужой видеокарте,
+# где часть памяти уже занята, первый заход может и не пройти.
+BATCH_FALLBACKS = (2, 0)  # 0 — обычный ход, без пачек
 
 AUDIO_EXTENSIONS = (
     ".mp3", ".wav", ".m4a", ".mp4", ".ogg", ".oga", ".opus", ".flac",
@@ -148,6 +170,20 @@ def bundled_models() -> set[str]:
     if not folder.is_dir():
         return set()
     return {p.name for p in folder.iterdir() if (p / "model.bin").is_file()}
+
+
+def cached_models() -> set[str]:
+    """Модели, уже скачанные на этот компьютер: их не придётся качать снова."""
+    try:
+        from faster_whisper.utils import _MODELS
+
+        home = os.environ.get("HF_HOME")
+        cache = (Path(home) if home else Path.home() / ".cache" / "huggingface") / "hub"
+        present = {p.name for p in cache.iterdir() if p.is_dir()}
+        return {name for name, repo in _MODELS.items()
+                if "models--" + repo.replace("/", "--") in present}
+    except Exception:
+        return set()
 
 
 def diarization_available() -> bool:
@@ -257,9 +293,63 @@ class Engine:
         result = Result(path=path)
         collected = []
 
-        segments, info = self._transcribe_segments(model, audio, language,
-                                                   word_timestamps=job is not None)
+        # Пробуем пачками покрупнее, а если видеопамяти не хватило — мельче.
+        # Уже показанные строки при этом обнуляются: окно перерисует их заново.
+        batches = [BATCH_SIZES.get(model_name, DEFAULT_BATCH), *BATCH_FALLBACKS]
+        for attempt, batch in enumerate(batches):
+            collected.clear()
+            result.lines.clear()
+            try:
+                info = self._one_pass(model, audio, language, batch, job, cancel,
+                                      duration, on_progress, result, collected)
+                break
+            except Cancelled:
+                raise
+            except Exception as exc:
+                if attempt == len(batches) - 1 or not _out_of_memory(exc):
+                    raise
+                on_progress(Progress(
+                    "Не хватило видеопамяти — пробую щадящий режим…", -1.0))
+
         result.language = info.language
+
+        if job is not None:
+            # Хвост шкалы, оставленный в _one_pass на ожидание разметки голосов.
+            turns = self._collect_diarization(job, cancel, on_progress, tail=0.12)
+            if turns:
+                result.lines = [line for segment in collected
+                                for line in _split_by_speaker(segment, turns)]
+
+        result.speakers = len({line.speaker for line in result.lines if line.speaker})
+        return result
+
+    def _one_pass(self, model, audio, language: str, batch: int, job, cancel,
+                  duration: float, on_progress: Callable[[Progress], None],
+                  result: "Result", collected: list):
+        """Один заход расшифровки: отдаёт строки по мере готовности.
+
+        Пакетный режим гоняет через видеокарту несколько кусков речи разом.
+        Замер на 17 минутах: 87 секунд обычным ходом против 46 пачками по 8.
+        batch=0 — обычный ход, к нему откатываемся, если не хватило памяти.
+        """
+        options = dict(
+            language=language or None,
+            beam_size=5,
+            vad_filter=True,  # пропускаем тишину: быстрее и меньше выдуманных фраз
+            vad_parameters={"min_silence_duration_ms": 500},
+            word_timestamps=job is not None,  # нужны, чтобы резать реплики по голосам
+        )
+
+        if batch:
+            from faster_whisper import BatchedInferencePipeline
+
+            if self._batched is None:
+                self._batched = BatchedInferencePipeline(model=model)
+            segments, info = self._batched.transcribe(audio, batch_size=batch, **options)
+        else:
+            segments, info = model.transcribe(audio, condition_on_previous_text=False,
+                                              **options)
+
         detected = f"язык: {info.language} ({info.language_probability:.0%})"
         tail = 0.12 if job else 0.0  # хвост шкалы оставляем на ожидание разметки
 
@@ -277,38 +367,7 @@ class Engine:
                 f"{detected}{note}",
                 (1 - tail) * share, line=line,
             ))
-
-        if job is not None:
-            turns = self._collect_diarization(job, cancel, on_progress, tail)
-            if turns:
-                result.lines = [line for segment in collected
-                                for line in _split_by_speaker(segment, turns)]
-
-        result.speakers = len({line.speaker for line in result.lines if line.speaker})
-        return result
-
-    def _transcribe_segments(self, model, audio, language: str, word_timestamps: bool):
-        """Расшифровка пачками, если получится: на длинной записи это вдвое быстрее.
-
-        Пакетный режим гоняет через видеокарту сразу несколько кусков речи между
-        паузами. Замер на 17 минутах: 87 секунд обычным ходом против 46 пачками.
-        """
-        options = dict(
-            language=language or None,
-            beam_size=5,
-            vad_filter=True,  # пропускаем тишину: быстрее и меньше выдуманных фраз
-            vad_parameters={"min_silence_duration_ms": 500},
-            word_timestamps=word_timestamps,  # нужны, чтобы резать реплики по смене голоса
-        )
-        try:
-            from faster_whisper import BatchedInferencePipeline
-
-            if self._batched is None:
-                self._batched = BatchedInferencePipeline(model=model)
-            return self._batched.transcribe(audio, batch_size=BATCH_SIZE, **options)
-        except Exception:
-            # Старая версия faster-whisper или не хватило видеопамяти — идём обычным ходом.
-            return model.transcribe(audio, condition_on_previous_text=False, **options)
+        return info
 
     def _start_diarization(self, path: str, speakers: int | None, duration: float,
                            on_progress: Callable[[Progress], None]) -> Diarization | None:
@@ -359,6 +418,13 @@ class Engine:
             message = f"Нашёл голосов: {found}"
         on_progress(Progress(message, 1.0))
         return turns
+
+
+def _out_of_memory(exc: Exception) -> bool:
+    """Похоже ли это на нехватку видеопамяти, а не на другую поломку."""
+    message = str(exc).lower()
+    return any(sign in message for sign in
+               ("out of memory", "cuda failed", "cublas", "cudnn", "alloc"))
 
 
 def _split_by_speaker(segment, turns: list[Line]) -> Iterator[Line]:

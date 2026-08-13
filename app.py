@@ -28,8 +28,9 @@ if "--diarize" in sys.argv:
 import exports  # noqa: E402
 import ui  # noqa: E402
 from common import format_time, lower_priority  # noqa: E402
-from engine import (AUDIO_EXTENSIONS, LANGUAGES, MODELS, SPEAKER_COUNTS, Cancelled,  # noqa: E402
-                    Engine, Line, Progress, Result, diarization_available)
+from engine import (AUDIO_EXTENSIONS, LANGUAGES, MODEL_DOWNLOADS, MODELS,  # noqa: E402
+                    SPEAKER_COUNTS, Cancelled, Engine, Line, Progress, Result,
+                    bundled_models, cached_models, diarization_available)
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -121,6 +122,7 @@ class App:
                                       values=[label for _, label in MODELS], width=26,
                                       style="trnslt.TCombobox", font=(ui.FONT, 10))
         self.model_box.pack(anchor="w", pady=(3, 0))
+        self.model_box.bind("<<ComboboxSelected>>", self._on_model_change)
 
         lang_box = tk.Frame(row, bg=ui.BG)
         lang_box.pack(side="left")
@@ -213,6 +215,15 @@ class App:
 
         self.device_label = tk.Label(actions, text="", bg=ui.BG, fg=ui.FG_DIM, font=(ui.FONT, 9))
         self.device_label.pack(side="right")
+
+    def _on_model_change(self, _event=None) -> None:
+        """Предупреждает, что выбранная модель ещё не скачана."""
+        name = self._pick(MODELS, self.model_var)
+        if name in bundled_models() or name in cached_models():
+            return
+        size = MODEL_DOWNLOADS.get(name)
+        self._set_status(f"Модель {name} скачается при первом запуске"
+                         + (f" (~{size}, нужен интернет)" if size else ""))
 
     def _on_diar_toggle(self) -> None:
         self.speakers_box.configure(state="readonly" if self.diar_var.get() else "disabled")
@@ -353,9 +364,13 @@ class App:
 
                 elif kind == "file_done":
                     result: Result = event[1]
-                    if self.results:  # берём итоговые язык и число голосов
-                        self.results[-1].language = result.language
-                        self.results[-1].speakers = result.speakers
+                    # Забираем итог целиком, а не только язык с числом голосов:
+                    # по ходу расшифровки строки приходят ещё без имён — голоса
+                    # размечаются параллельно и проставляются в самом конце.
+                    if self.results:
+                        self.results[-1] = result
+                    else:
+                        self.results.append(result)
                     self._render()  # перерисовываем: реплики склеиваются по говорящим
 
                 elif kind == "finished":
