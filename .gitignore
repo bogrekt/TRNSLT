@@ -1,0 +1,19 @@
+# Окружение Python — ставится из requirements.txt
+.venv/
+__pycache__/
+*.pyc
+
+# Готовая сборка и рабочие файлы PyInstaller
+dist/
+build/
+*.spec.bak
+
+# Модели и CUDA-библиотеки: сотни мегабайт, качаются сборщиком заново.
+# cublasLt64_12.dll весит 638 МБ — GitHub не примет файл больше 100 МБ.
+build_payload/
+
+# Отчёты проверок и временное
+trnslt-selftest.log
+*.log
+*.docx
+*.tmp

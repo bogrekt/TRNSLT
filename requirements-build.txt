@@ -1,0 +1,11 @@
+# Нужно только для сборки приложения, в сам trnslt.exe не попадает.
+pyinstaller>=6.0
+
+# make_icon.py — рисует иконку
+pillow
+
+# shrink_model.py — пережимает модель в 8 бит.
+# torch ставить в версии для процессора:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+transformers
+torch

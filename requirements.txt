@@ -1,0 +1,9 @@
+# Для работы приложения
+faster-whisper>=1.2.0
+sherpa-onnx>=1.13.5
+python-docx>=1.2.0
+tkinterdnd2>=0.6.2
+
+# Ускорение на видеокартах NVIDIA. cuDNN не нужен: ctranslate2 для Whisper
+# его не трогает — проверено удалением из готовой сборки.
+nvidia-cublas-cu12
